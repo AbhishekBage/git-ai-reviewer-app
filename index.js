@@ -8,17 +8,20 @@ dotenv.config();
 
 const server = express();
 
-server.use(express.json({
-    limit: "10mb"
-}));
+server.use(
+    express.json({
+        limit: "20mb"
+    })
+);
 
 
 // =======================
-// GitHub App
+// GitHub App Config
 // =======================
 
 const githubApp = new App({
     appId: process.env.GITHUB_APP_ID,
+
     privateKey: fs.readFileSync(
         process.env.GITHUB_PRIVATE_KEY_PATH,
         "utf8"
@@ -27,7 +30,7 @@ const githubApp = new App({
 
 
 // =======================
-// Gemini
+// Gemini Config
 // =======================
 
 const genAI = new GoogleGenAI({
@@ -35,28 +38,34 @@ const genAI = new GoogleGenAI({
 });
 
 
+
 // =======================
-// AI Reviewer
+// Gemini Review Function
 // =======================
 
 async function reviewCode(diff) {
 
     const prompt = `
-You are a senior software engineer.
+You are a senior software engineer doing a Pull Request review.
 
-Review this Pull Request diff.
+Analyze the following git diff.
 
-Find:
+Review for:
 - Bugs
-- Security issues
-- Performance problems
-- Bad practices
-- Missing validations
-- Code improvements
+- Security vulnerabilities
+- Performance issues
+- Memory leaks
+- Race conditions
+- Bad coding practices
+- Missing error handling
+- Code maintainability
 
-Give clear actionable feedback.
+Give useful comments only.
+Do not explain obvious changes.
 
-DIFF:
+Return review in markdown.
+
+PR DIFF:
 
 ${diff}
 `;
@@ -65,6 +74,7 @@ ${diff}
     const response =
         await genAI.models.generateContent({
             model: "gemini-2.5-flash",
+
             contents: prompt
         });
 
@@ -74,178 +84,310 @@ ${diff}
 
 
 
+
+
 // =======================
-// Webhook
+// GitHub Webhook
 // =======================
 
 server.post(
     "/github/webhook",
 
-    async (req,res)=>{
+    async (req, res) => {
 
-    try {
+        try {
 
-        const event =
-            req.headers["x-github-event"];
-
-
-        if(event !== "pull_request"){
-            return res.send(
-                "ignored"
-            );
-        }
+            const event =
+                req.headers["x-github-event"];
 
 
-        const payload=req.body;
-
-
-        if(
-          payload.action !== "opened" &&
-          payload.action !== "synchronize"
-        ){
-            return res.send(
-                "ignored action"
-            );
-        }
-
-
-        const installationId =
-            payload.installation.id;
-
-
-        const owner =
-            payload.repository.owner.login;
-
-
-        const repo =
-            payload.repository.name;
-
-
-        const pullNumber =
-            payload.pull_request.number;
-
-
-
-        console.log(
-            "Reviewing PR:",
-            pullNumber
-        );
-
-
-        // GitHub Auth
-
-        const octokit =
-            await githubApp
-            .getInstallationOctokit(
-                installationId
+            console.log(
+                "GitHub Event:",
+                event
             );
 
 
+            if (event !== "pull_request") {
 
-        // Get PR diff
+                return res.json({
+                    message:
+                        "Ignored event"
+                });
+            }
 
-        const files =
-            await octokit.rest.pulls.listFiles({
-                owner,
-                repo,
-                pull_number:
+
+
+            const payload = req.body;
+
+
+
+            // Only run on new PR or new commits
+
+            if (
+                payload.action !== "opened" &&
+                payload.action !== "synchronize"
+            ) {
+
+                return res.json({
+                    message:
+                        "Ignored PR action"
+                });
+            }
+
+
+
+            const installationId =
+                payload.installation.id;
+
+
+            const owner =
+                payload.repository.owner.login;
+
+
+            const repo =
+                payload.repository.name;
+
+
+            const pullNumber =
+                payload.pull_request.number;
+
+
+
+            console.log(
+                "Reviewing:",
+                {
+                    owner,
+                    repo,
                     pullNumber
-            });
+                }
+            );
 
 
 
-        let completeDiff="";
+            // =======================
+            // Authenticate GitHub App
+            // =======================
 
 
-        for(
-            const file of files.data
-        ){
+            const octokit =
+                await githubApp
+                    .getInstallationOctokit(
+                        installationId
+                    );
 
-            completeDiff += `
+
+
+
+            // =======================
+            // Get PR Diff
+            // =======================
+
+
+            const files =
+                await octokit.request(
+
+                    "GET /repos/{owner}/{repo}/pulls/{pull_number}/files",
+
+                    {
+                        owner,
+
+                        repo,
+
+                        pull_number:
+                            pullNumber
+                    }
+
+                );
+
+
+
+
+            let completeDiff = "";
+
+
+
+            for (const file of files.data) {
+
+
+                completeDiff += `
+
+=================================
 
 FILE:
 ${file.filename}
 
 
+STATUS:
+${file.status}
+
+
 PATCH:
+
 ${file.patch}
 
 `;
 
-        }
+            }
 
 
-        console.log(
-            "Sending diff to Gemini..."
-        );
 
 
-        const aiReview =
-            await reviewCode(
-                completeDiff
+            if (!completeDiff.trim()) {
+
+
+                return res.json({
+                    message:
+                        "No diff found"
+                });
+
+            }
+
+
+
+
+            console.log(
+                "Sending diff to Gemini..."
             );
 
 
-        console.log(
-            aiReview
-        );
+
+
+            // =======================
+            // AI Review
+            // =======================
+
+
+            const aiReview =
+                await reviewCode(
+                    completeDiff
+                );
 
 
 
-        // Post Review Comment
-
-        await octokit.rest.issues.createComment({
-
-            owner,
-
-            repo,
-
-            issue_number:
-                pullNumber,
+            console.log(
+                "AI Review Completed"
+            );
 
 
-            body:
-`
-## 🤖 AI Code Review
+
+
+
+            // =======================
+            // Post Comment on PR
+            // =======================
+
+
+            await octokit.request(
+
+                "POST /repos/{owner}/{repo}/issues/{issue_number}/comments",
+
+                {
+
+                    owner,
+
+                    repo,
+
+
+                    issue_number:
+                        pullNumber,
+
+
+                    body:
+                        `
+## 🤖 AI Pull Request Review
+
 
 ${aiReview}
 `
 
-        });
+                }
+
+            );
 
 
 
-        res.json({
-            status:
-            "review completed"
-        });
+            console.log(
+                "Comment added to PR"
+            );
 
+
+
+
+            return res.json({
+
+                status:
+                    "Review completed",
+
+                filesReviewed:
+                    files.data.length
+
+            });
+
+
+
+        } catch (error) {
+
+
+            console.error(
+                error
+            );
+
+
+            return res
+                .status(500)
+                .json({
+
+                    error:
+                        error.message
+
+                });
+
+        }
 
     }
-    catch(err){
 
-        console.error(err);
-
-
-        res.status(500)
-        .json({
-            error:
-            err.message
-        });
-    }
-
-
-});
+);
 
 
 
-server.listen(
-    process.env.PORT,
-    ()=>{
 
-        console.log(
-            `Server running ${process.env.PORT}`
+// =======================
+// Health Check
+// =======================
+
+
+server.get(
+    "/",
+
+    (req, res) => {
+
+        res.send(
+            "GitHub AI Reviewer Running 🚀"
         );
 
     }
+);
+
+
+
+
+
+// =======================
+// Start Server
+// =======================
+
+
+server.listen(
+
+    process.env.PORT || 3000,
+
+    () => {
+
+        console.log(
+            `Server running on port ${process.env.PORT || 3000
+            }`
+        );
+
+    }
+
 );
